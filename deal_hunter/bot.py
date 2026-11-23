@@ -127,51 +127,207 @@ async def remover(interaction: discord.Interaction, numero: int):
 async def teste(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Vinted Deal Hunter: bot ligado e a responder. Isto não confirma acesso à Vinted.")
 
+
+async def get_alert_channel(channel_id: int):
+    """Resolve a channel even when it is not yet in Discord's local cache."""
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException as exc:
+            print(f"Canal {channel_id}: falha ao obter canal: {exc}", flush=True)
+            return None
+    if not hasattr(channel, "send"):
+        print(f"Canal {channel_id}: não é um canal de mensagens.", flush=True)
+        return None
+    return channel
+
+
+def make_embed(item, label):
+    embed = discord.Embed(
+        title=item["title"][:256],
+        url=item["url"],
+        description=f"Pesquisa: **{discord.utils.escape_markdown(label)}**\n[Ver anúncio na Vinted]({item['url']})",
+        color=0x33AABB,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if item["image"].startswith("https://"):
+        embed.set_thumbnail(url=item["image"])
+    return embed
+
+
+@tree.command(name="testar_envio", description="Testar envio direto de mensagens neste canal")
+@app_commands.guild_only()
+async def testar_envio(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    channel = await get_alert_channel(interaction.channel_id)
+    if not channel:
+        await interaction.followup.send("Não consegui localizar o canal. Consulta o CMD.", ephemeral=True)
+        return
+    try:
+        await channel.send("✅ Teste de envio do Vinted Deal Hunter neste canal.")
+        await interaction.followup.send("✅ Mensagem enviada para o canal.", ephemeral=True)
+    except discord.HTTPException as exc:
+        print(f"Falha no teste de envio: {exc}", flush=True)
+        await interaction.followup.send(
+            f"❌ Falha a enviar: {type(exc).__name__} (HTTP {exc.status}). Verifica Ver Canal e Enviar Mensagens.",
+            ephemeral=True,
+        )
+
+
+@tree.command(name="recuperar", description="Reenviar até 15 anúncios atuais de uma pesquisa")
+@app_commands.describe(numero="ID apresentado em /pesquisas", quantidade="Número de anúncios a reenviar (1 a 15)")
+@app_commands.guild_only()
+async def recuperar(interaction: discord.Interaction, numero: int, quantidade: int = 5):
+    quantidade = max(1, min(15, quantidade))
+    await interaction.response.defer(ephemeral=True)
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT label,url,channel_id FROM searches WHERE guild_id=? AND id=?",
+            (interaction.guild_id, numero)
+        ).fetchone()
+    if not row:
+        await interaction.followup.send("Pesquisa não encontrada.", ephemeral=True)
+        return
+    label, url, channel_id = row
+    channel = await get_alert_channel(channel_id)
+    if not channel:
+        await interaction.followup.send("Não consigo aceder ao canal original da pesquisa.", ephemeral=True)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            await interaction.followup.send(
+                f"Vinted: HTTP {response.status_code}. Não tentei contornar a restrição.", ephemeral=True
+            )
+            return
+        items = extract_items(response.text)[:quantidade]
+        if not items:
+            await interaction.followup.send("Não encontrei anúncios acessíveis no HTML.", ephemeral=True)
+            return
+        delivered = 0
+        for item in items:
+            await channel.send(embed=make_embed(item, label))
+            with db_connect() as db:
+                db.execute(
+                    "INSERT OR IGNORE INTO seen(search_id,item_id) VALUES(?,?)",
+                    (numero, item["id"])
+                )
+            delivered += 1
+            await asyncio.sleep(1)
+        print(f"Recuperação {numero}: {delivered} alertas enviados.", flush=True)
+        await interaction.followup.send(
+            f"✅ Reenviei {delivered} anúncios atuais para o canal original. "
+            "Alguns podem ser antigos ou já ter sido apresentados.",
+            ephemeral=True,
+        )
+    except (httpx.HTTPError, discord.HTTPException) as exc:
+        print(f"Recuperação {numero}: {type(exc).__name__}: {exc}", flush=True)
+        await interaction.followup.send(
+            f"❌ Interrompido após {locals().get('delivered', 0)} envios: {type(exc).__name__}. Consulta o CMD.",
+            ephemeral=True,
+        )
+
+
 async def monitor():
     await bot.wait_until_ready()
-    async with httpx.AsyncClient(timeout=15,follow_redirects=False,
-                                 headers={"User-Agent":"VintedDealHunter/1.0 (public-page-monitor)"}) as client:
+    async with httpx.AsyncClient(
+        timeout=15,
+        follow_redirects=False,
+        headers={"User-Agent": "VintedDealHunter/1.0 (public-page-monitor)"},
+    ) as client:
         while not bot.is_closed():
             with db_connect() as db:
-                searches = db.execute("SELECT id,channel_id,label,url,initialized FROM searches").fetchall()
-            for search_id,channel_id,label,url,initialized in searches:
+                searches = db.execute(
+                    "SELECT id,channel_id,label,url,initialized FROM searches"
+                ).fetchall()
+            for search_id, channel_id, label, url, initialized in searches:
                 try:
                     response = await client.get(url)
                     if response.status_code != 200:
-                        print(f"Pesquisa {search_id}: HTTP {response.status_code}; sem alertas")
+                        print(f"Pesquisa {search_id}: HTTP {response.status_code}; sem alertas", flush=True)
                         continue
                     items = extract_items(response.text)
                     if not items:
-                        print(f"Pesquisa {search_id}: resultados não acessíveis no HTML; sem alertas")
+                        print(f"Pesquisa {search_id}: HTML sem anúncios acessíveis", flush=True)
                         continue
-                    new_items=[]
+
                     with db_connect() as db:
-                        for item in items:
-                            exists=db.execute("SELECT 1 FROM seen WHERE search_id=? AND item_id=?",
-                                              (search_id,item["id"])).fetchone()
-                            if not exists:
-                                db.execute("INSERT INTO seen(search_id,item_id) VALUES(?,?)",
-                                           (search_id,item["id"]))
-                                if initialized: new_items.append(item)
-                        db.execute("UPDATE searches SET initialized=1 WHERE id=?",(search_id,))
+                        unseen = [
+                            item for item in items
+                            if not db.execute(
+                                "SELECT 1 FROM seen WHERE search_id=? AND item_id=?",
+                                (search_id, item["id"])
+                            ).fetchone()
+                        ]
+
+                    if not initialized:
+                        # Initial snapshot deliberately does not alert historical listings.
+                        with db_connect() as db:
+                            for item in unseen:
+                                db.execute(
+                                    "INSERT OR IGNORE INTO seen(search_id,item_id) VALUES(?,?)",
+                                    (search_id, item["id"])
+                                )
+                            db.execute(
+                                "UPDATE searches SET initialized=1 WHERE id=?", (search_id,)
+                            )
+                        print(
+                            f"Pesquisa {search_id} ({label}): primeira leitura, "
+                            f"{len(items)} anúncios guardados como referência.",
+                            flush=True,
+                        )
+                        continue
+
                     print(
                         f"Pesquisa {search_id} ({label}): "
-                        f"{len(items)} anúncios visíveis, "
-                        f"{len(new_items)} novos, "
-                        f"primeira leitura={not bool(initialized)}",
+                        f"{len(items)} anúncios visíveis, {len(unseen)} por enviar.",
                         flush=True,
                     )
-                    channel = bot.get_channel(channel_id)
-                    if channel and initialized:
-                        for item in new_items[:15]:
-                            embed=discord.Embed(title=item["title"],url=item["url"],
-                                                description=f"Nova publicação em **{label}**",
-                                                color=0x33AABB,
-                                                timestamp=datetime.now(timezone.utc))
-                            if item["image"].startswith("https://"): embed.set_thumbnail(url=item["image"])
-                            await channel.send(embed=embed)
-                except (httpx.HTTPError,discord.HTTPException) as ex:
-                    print(f"Pesquisa {search_id}: {type(ex).__name__}: {ex}")
+                    if not unseen:
+                        continue
+
+                    channel = await get_alert_channel(channel_id)
+                    if channel is None:
+                        print(
+                            f"Pesquisa {search_id}: canal {channel_id} inacessível; "
+                            f"{len(unseen)} anúncios permanecem por enviar.",
+                            flush=True,
+                        )
+                        continue
+
+                    delivered = 0
+                    for item in unseen:
+                        try:
+                            await channel.send(embed=make_embed(item, label))
+                        except discord.HTTPException as exc:
+                            print(
+                                f"Pesquisa {search_id}: ENVIO FALHOU "
+                                f"(HTTP {exc.status}) canal={channel_id} item={item['id']}: {exc}",
+                                flush=True,
+                            )
+                            break
+                        # Persist only after Discord confirms a successful send.
+                        with db_connect() as db:
+                            db.execute(
+                                "INSERT OR IGNORE INTO seen(search_id,item_id) VALUES(?,?)",
+                                (search_id, item["id"])
+                            )
+                        delivered += 1
+                        await asyncio.sleep(1)
+                    print(
+                        f"Pesquisa {search_id}: entregues {delivered}/{len(unseen)}. "
+                        "Os restantes serão tentados na próxima verificação.",
+                        flush=True,
+                    )
+                except httpx.HTTPError as exc:
+                    print(f"Pesquisa {search_id}: erro HTTP: {exc}", flush=True)
+                except Exception as exc:
+                    print(
+                        f"Pesquisa {search_id}: erro inesperado {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 await asyncio.sleep(2)
             await asyncio.sleep(INTERVAL)
 
