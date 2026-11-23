@@ -13,6 +13,9 @@ from discord import app_commands
 from discord.ext import commands
 from bs4 import BeautifulSoup
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
