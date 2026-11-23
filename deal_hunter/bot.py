@@ -154,6 +154,13 @@ async def monitor():
                                            (search_id,item["id"]))
                                 if initialized: new_items.append(item)
                         db.execute("UPDATE searches SET initialized=1 WHERE id=?",(search_id,))
+                    print(
+                        f"Pesquisa {search_id} ({label}): "
+                        f"{len(items)} anúncios visíveis, "
+                        f"{len(new_items)} novos, "
+                        f"primeira leitura={not bool(initialized)}",
+                        flush=True,
+                    )
                     channel = bot.get_channel(channel_id)
                     if channel and initialized:
                         for item in new_items[:15]:
