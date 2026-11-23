@@ -173,6 +173,8 @@ async def startup():
     if not TOKEN: raise RuntimeError("Configura DISCORD_BOT_TOKEN.")
     with db_connect(): pass
     async with bot:
+        # Discord must provide application_id before commands can be synced.
+        await bot.login(TOKEN)
         if GUILD_ID:
             guild=discord.Object(id=int(GUILD_ID))
             tree.copy_global_to(guild=guild)
@@ -180,7 +182,7 @@ async def startup():
         else:
             await tree.sync()
         task=asyncio.create_task(monitor())
-        try: await bot.start(TOKEN)
+        try: await bot.connect(reconnect=True)
         finally: task.cancel()
 
 if __name__=="__main__":
